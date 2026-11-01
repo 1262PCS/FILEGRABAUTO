@@ -6,33 +6,36 @@ import time
 import pyautogui
 from pathlib import Path
 
+
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
 
 MODEL_PATH = Path(__file__).resolve().parent / "hand_landmarker.task"
 
-# Gesture thresholds
+# Pinch detection thresholds
 GRAB_THRESHOLD = 0.35
 RELEASE_THRESHOLD = 0.50
 
-# Adaptive smoothing
-SLOW_ALPHA = 0.12
-MEDIUM_ALPHA = 0.30
-FAST_ALPHA = 0.65
+# Gesture confirmation times (seconds)
+PINCH_CONFIRM_TIME = 0.15
+RELEASE_CONFIRM_TIME = 0.15
 
-# Ignore tiny movements
-DEAD_ZONE = 3
+# Improved cursor smoothing
+SMOOTHING_ALPHA = 0.35
+DEAD_ZONE = 5
+MAX_STEP = 100
 
 # Camera calibration
 CAMERA_MARGIN = 0.15
 SCREEN_PADDING = 10
 
-# PyAutoGUI safety
+# Mouse safety
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
-screen_width, screen_height = pyautogui.size()
+SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
+
 
 # ==========================================
 # 2. MEDIAPIPE CONFIGURATION
@@ -59,6 +62,7 @@ HAND_CONNECTIONS = [
     (13, 17), (17, 18), (18, 19), (19, 20),
     (0, 17)
 ]
+
 
 # ==========================================
 # 3. PINCH DISTANCE
@@ -93,8 +97,8 @@ def calculate_pinch_distance(hand):
 
 def map_to_screen(finger_x, finger_y):
     """
-    Convert normalized camera coordinates
-    into Windows screen coordinates.
+    Map normalized camera coordinates
+    to Windows screen coordinates.
     """
 
     x = (finger_x - CAMERA_MARGIN) / (
@@ -109,18 +113,18 @@ def map_to_screen(finger_x, finger_y):
     y = max(0.0, min(1.0, y))
 
     screen_x = SCREEN_PADDING + x * (
-        screen_width - 2 * SCREEN_PADDING
+        SCREEN_WIDTH - 2 * SCREEN_PADDING
     )
 
     screen_y = SCREEN_PADDING + y * (
-        screen_height - 2 * SCREEN_PADDING
+        SCREEN_HEIGHT - 2 * SCREEN_PADDING
     )
 
     return screen_x, screen_y
 
 
 # ==========================================
-# 5. ADAPTIVE CURSOR SMOOTHING
+# 5. IMPROVED CURSOR SMOOTHING
 # ==========================================
 
 def smooth_cursor(
@@ -130,38 +134,30 @@ def smooth_cursor(
     previous_y
 ):
     """
-    Adaptive EMA smoothing with a dead zone.
+    Smooth cursor movement while maintaining
+    responsiveness.
     """
 
     if previous_x is None or previous_y is None:
         return target_x, target_y
 
-    movement = math.hypot(
-        target_x - previous_x,
-        target_y - previous_y
-    )
+    dx = target_x - previous_x
+    dy = target_y - previous_y
+
+    distance = math.hypot(dx, dy)
 
     # Ignore tiny movements
-    if movement < DEAD_ZONE:
+    if distance < DEAD_ZONE:
         return previous_x, previous_y
 
-    # Adaptive smoothing
-    if movement < 5:
-        alpha = SLOW_ALPHA
-    elif movement < 25:
-        alpha = MEDIUM_ALPHA
-    else:
-        alpha = FAST_ALPHA
+    # Limit sudden jumps
+    if distance > MAX_STEP:
+        scale = MAX_STEP / distance
+        dx *= scale
+        dy *= scale
 
-    smooth_x = (
-        alpha * target_x
-        + (1 - alpha) * previous_x
-    )
-
-    smooth_y = (
-        alpha * target_y
-        + (1 - alpha) * previous_y
-    )
+    smooth_x = previous_x + SMOOTHING_ALPHA * dx
+    smooth_y = previous_y + SMOOTHING_ALPHA * dy
 
     return smooth_x, smooth_y
 
@@ -205,9 +201,9 @@ def draw_hand(frame, hand):
 def draw_status(
     frame,
     gesture,
-    gesture_color,
     distance,
     cursor_enabled,
+    mouse_is_down,
     cursor_position
 ):
     height, width, _ = frame.shape
@@ -217,15 +213,24 @@ def draw_status(
     cv2.rectangle(
         overlay,
         (10, 10),
-        (min(width - 10, 430), 195),
+        (min(width - 10, 450), 220),
         (30, 30, 30),
         -1
     )
 
     cv2.addWeighted(
-        overlay, 0.65,
-        frame, 0.35,
-        0, frame
+        overlay,
+        0.7,
+        frame,
+        0.3,
+        0,
+        frame
+    )
+
+    gesture_color = (
+        (0, 255, 0)
+        if mouse_is_down
+        else (255, 255, 255)
     )
 
     cv2.putText(
@@ -233,7 +238,7 @@ def draw_status(
         gesture,
         (25, 45),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.85,
+        0.8,
         gesture_color,
         2
     )
@@ -272,18 +277,36 @@ def draw_status(
         2
     )
 
-    if cursor_position is not None:
-        x, y = cursor_position
-        position_text = f"Screen: ({x}, {y})"
-    else:
-        position_text = "Screen: --"
+    mouse_text = (
+        "Mouse: DOWN"
+        if mouse_is_down
+        else "Mouse: UP"
+    )
+
+    cv2.putText(
+        frame,
+        mouse_text,
+        (25, 165),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 0)
+        if mouse_is_down
+        else (255, 255, 255),
+        2
+    )
+
+    position_text = (
+        f"Screen: {cursor_position}"
+        if cursor_position is not None
+        else "Screen: --"
+    )
 
     cv2.putText(
         frame,
         position_text,
-        (25, 165),
+        (25, 205),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
+        0.55,
         (255, 255, 255),
         2
     )
@@ -317,23 +340,32 @@ def main():
     # Gesture state
     is_holding = False
 
+    # Mouse state
+    mouse_is_down = False
+
     # Cursor control starts OFF
     cursor_enabled = False
 
-    # Smoothed cursor coordinates
+    # Smoothed coordinates
     smooth_x = None
     smooth_y = None
 
+    # Gesture confirmation timers
+    pinch_started_at = None
+    release_started_at = None
+
+    # MediaPipe timestamps
     start_time = time.monotonic()
     last_timestamp_ms = -1
 
     print("=" * 45)
-    print("GESTURE FILE TRANSFER - PHASE 2")
+    print("GESTURE FILE TRANSFER - PHASE 2.3")
     print("=" * 45)
     print("M = Enable / Disable cursor")
     print("Q = Quit")
-    print("Pinch = GRABBING (visual only)")
-    print("No clicks or file operations yet")
+    print("Pinch = Hold left mouse button")
+    print("Release = Release left mouse button")
+    print("Tracking landmark: Index knuckle (5)")
     print("=" * 45)
 
     try:
@@ -352,7 +384,7 @@ def main():
 
                 height, width, _ = frame.shape
 
-                # Convert OpenCV BGR to RGB
+                # Convert BGR to RGB
                 rgb_frame = cv2.cvtColor(
                     frame,
                     cv2.COLOR_BGR2RGB
@@ -363,31 +395,28 @@ def main():
                     data=rgb_frame
                 )
 
-                # Generate increasing timestamps
-                timestamp_ms = int(
-                    (time.monotonic() - start_time) * 1000
-                )
-
+                # Increasing timestamps
                 timestamp_ms = max(
-                    timestamp_ms,
+                    int(
+                        (time.monotonic() - start_time)
+                        * 1000
+                    ),
                     last_timestamp_ms + 1
                 )
 
                 last_timestamp_ms = timestamp_ms
 
-                # Detect hand landmarks
                 result = landmarker.detect_for_video(
                     mp_image,
                     timestamp_ms
                 )
 
                 gesture = "NO HAND DETECTED"
-                gesture_color = (200, 200, 200)
                 distance = None
                 cursor_position = None
 
                 # ==================================
-                # HAND DETECTION
+                # HAND DETECTED
                 # ==================================
 
                 if result.hand_landmarks:
@@ -395,7 +424,6 @@ def main():
 
                     draw_hand(frame, hand)
 
-                    # Calculate pinch distance
                     distance = calculate_pinch_distance(
                         hand
                     )
@@ -413,25 +441,24 @@ def main():
                     ):
                         is_holding = False
 
-                    if is_holding:
-                        gesture = "GRABBING"
-                        gesture_color = (0, 255, 0)
-                    else:
-                        gesture = "RELEASED"
-                        gesture_color = (0, 0, 255)
-
-                    # ==================================
-                    # INDEX FINGER TRACKING
-                    # ==================================
-
-                    index_tip = hand[8]
-
-                    target_x, target_y = map_to_screen(
-                        index_tip.x,
-                        index_tip.y
+                    gesture = (
+                        "GRABBING"
+                        if is_holding
+                        else "RELEASED"
                     )
 
-                    # Adaptive smoothing
+                    # ==================================
+                    # INDEX KNUCKLE TRACKING
+                    # ==================================
+
+                    # Landmark 5 is more stable during pinch
+                    pointer = hand[5]
+
+                    target_x, target_y = map_to_screen(
+                        pointer.x,
+                        pointer.y
+                    )
+
                     smooth_x, smooth_y = smooth_cursor(
                         target_x,
                         target_y,
@@ -447,12 +474,12 @@ def main():
                         cursor_y
                     )
 
-                    # Draw yellow circle on fingertip
+                    # Draw yellow circle on tracked knuckle
                     cv2.circle(
                         frame,
                         (
-                            int(index_tip.x * width),
-                            int(index_tip.y * height)
+                            int(pointer.x * width),
+                            int(pointer.y * height)
                         ),
                         12,
                         (0, 255, 255),
@@ -460,7 +487,7 @@ def main():
                     )
 
                     # ==================================
-                    # WINDOWS CURSOR CONTROL
+                    # WINDOWS MOUSE CONTROL
                     # ==================================
 
                     if cursor_enabled:
@@ -471,33 +498,83 @@ def main():
                                 duration=0
                             )
 
+                            now = time.monotonic()
+
+                            # Pinch -> mouseDown
+                            if is_holding:
+                                release_started_at = None
+
+                                if pinch_started_at is None:
+                                    pinch_started_at = now
+
+                                if (
+                                    not mouse_is_down
+                                    and now - pinch_started_at
+                                    >= PINCH_CONFIRM_TIME
+                                ):
+                                    pyautogui.mouseDown(
+                                        button="left"
+                                    )
+
+                                    mouse_is_down = True
+                                    print("Mouse DOWN")
+
+                            # Release -> mouseUp
+                            else:
+                                pinch_started_at = None
+
+                                if release_started_at is None:
+                                    release_started_at = now
+
+                                if (
+                                    mouse_is_down
+                                    and now - release_started_at
+                                    >= RELEASE_CONFIRM_TIME
+                                ):
+                                    pyautogui.mouseUp(
+                                        button="left"
+                                    )
+
+                                    mouse_is_down = False
+                                    print("Mouse UP")
+
                         except pyautogui.FailSafeException:
-                            print(
-                                "Emergency stop triggered."
-                            )
+                            print("Emergency stop triggered.")
                             break
 
+                # ==================================
+                # HAND LOST
+                # ==================================
+
                 else:
-                    # Reset when hand disappears
                     is_holding = False
+
                     smooth_x = None
                     smooth_y = None
 
+                    pinch_started_at = None
+                    release_started_at = None
+
+                    if mouse_is_down:
+                        pyautogui.mouseUp(button="left")
+                        mouse_is_down = False
+                        print("Mouse UP - hand lost")
+
                 # ==================================
-                # DISPLAY STATUS
+                # DISPLAY
                 # ==================================
 
                 draw_status(
                     frame,
                     gesture,
-                    gesture_color,
                     distance,
                     cursor_enabled,
+                    mouse_is_down,
                     cursor_position
                 )
 
                 cv2.imshow(
-                    "Gesture File Transfer - Phase 2",
+                    "Gesture File Transfer - Phase 2.3",
                     frame
                 )
 
@@ -512,17 +589,39 @@ def main():
                     smooth_x = None
                     smooth_y = None
 
+                    pinch_started_at = None
+                    release_started_at = None
+
+                    if mouse_is_down:
+                        pyautogui.mouseUp(button="left")
+                        mouse_is_down = False
+
                     print(
                         "Cursor control:",
-                        "ON" if cursor_enabled else "OFF"
+                        "ON"
+                        if cursor_enabled
+                        else "OFF"
                     )
 
     except KeyboardInterrupt:
         print("Stopped by user.")
 
+    except pyautogui.FailSafeException:
+        print("PyAutoGUI emergency stop.")
+
     finally:
+        if mouse_is_down:
+            try:
+                pyautogui.mouseUp(button="left")
+            except pyautogui.FailSafeException:
+                print(
+                    "Move physical mouse away from corner "
+                    "to allow mouse release."
+                )
+
         camera.release()
         cv2.destroyAllWindows()
+
         print("Application closed safely.")
 
 
